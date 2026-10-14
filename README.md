@@ -7,10 +7,10 @@ WorkBuddy 会话桥接连接器 —— 一个**零第三方依赖**的 MCP stdio
 
 | 能力 | 支持 | 说明 |
 | --- | --- | --- |
-| 读取本机会话索引（`~/.workbuddy/app/sessions.json`） | ✅ | 只读 |
+| 读取本机会话索引（`~/.workbuddy/app/sessions.json`） | ✅ | 只读；**Mac 客户端不生成该文件**，此时自动降级为目录扫描，见下 |
 | 读取会话消息（`projects/<slug>/<conversationId>.jsonl`） | ✅ | 只读，默认剥离 `<system-reminder>` 系统附加块 |
 | 读取子代理记录（`<conversationId>/subagents/*.jsonl`） | ✅ | 只读，`includeSubagents=true` 时返回 |
-| 关键词搜索历史会话 | ✅ | 启发式，只扫最近 N 个会话、每个文件末尾 M 字节 |
+| 列举 / 关键词搜索历史会话 | ✅ | 索引缺失时走「目录扫描兜底」，响应中用 `indexSource` / `resolvedVia` 如实标注 |
 | **直接向 WorkBuddy 会话下发并执行指令** | ❌ | **做不到，见下** |
 | 向指令队列投递指令（WorkBuddy 侧取件执行） | ✅ | 本连接器的写入能力**仅此一种** |
 | 读写 `workbuddy.db` / `-wal` / `-shm` | ❌ | 硬性禁止，会损坏客户端运行时状态 |
@@ -38,6 +38,40 @@ WorkBuddy 桌面端 `resources/wb-guest-sdk/wb.js` 里确实存在 `sendPrompt` 
 换句话说：**`wb_send_instruction` 是"投递"不是"下达"**。指令要真正被执行，必须由 WorkBuddy 内的
 agent（或用户）主动调用 `wb_pending_instructions` 取件。
 
+### 平台差异：Mac 客户端不生成 `app/sessions.json`
+
+WinPC 客户端会维护 `<workbuddyDir>/app/sessions.json` 作为会话索引；**Mac 客户端不写这个文件**
+（2026-10-14 实测：`~/.workbuddy` 全树 `find -name sessions.json` 零命中），但会话数据本身
+（`projects/<slug>/<conversationId>.jsonl`）照常落盘、格式与 WinPC 一致。
+
+若此处直接返回空，`wb_list_sessions` / `wb_search_sessions` 在 Mac 上就完全失效。因此索引不可读时
+**自动降级为只读目录扫描**，并如实标注（不掩盖索引缺失这一事实）：
+
+- `indexReadable: false`、`indexError: "NOT_FOUND: ..."`（原样保留）
+- `indexSource: "project-scan"`、`indexFallback: { reason, projectDirs, scannedFiles, truncated, note }`
+- 每个会话条目带 `resolvedVia: "project-scan"`，且 `workDir: null` / `workDirSource: "unknown"`
+  —— 目录名里的 `-` 与路径分隔符无法无损区分，故**不反推** `workDir`，直接给真实 `projectDir` / `filePath`。
+
+`wb_list_sessions` 的 `workDir` 过滤在扫描模式下自动改为 **slug 比对**，保持按工作目录过滤可用。
+
+> 红线不变：扫描只做 `stat` / `readdir` / `readFileSync`，绝不打开 `workbuddy.db` 及其 `-wal` / `-shm` / `-journal`。
+
+### 平台差异：宿主文件代理会改写 `error.code`
+
+部分宿主（含 WorkBuddy 自身的文件 syscall 代理）在拦截 `link` / `rename` 时会**把 `error.code`
+统一改写成自有标识**（实测 `CODEBUDDY_BROKER_DENY`）并抹掉 `error.errno`，但 `error.message`
+仍保留原始 errno 前缀（`ENOENT: ...` / `EEXIST: ...`）。
+
+只读 `error.code` 的判定在此环境下会全体失效：并发领取的「目标已存在」不再被当作**竞争失败静默跳过**，
+而是抛 `STORE_RENAME_FAILED`（本机实测 8 进程并发下 7 个失败）。因此：
+
+- 新增 `errnoOf(error)`：优先取 errno 形态的 `code`，否则回退解析 `message` 前缀；
+- `linkWithRetry` 对**不可识别**的失败启用**只读探针**（`classifyByProbe`）：源已不在 ⇒ `GONE`，
+  目标已存在 ⇒ `EXISTS`，两者都按「本次竞争没赢」跳过。两种情况**都不删除任何文件**，
+  记录若仍在 `pending` 只会在后续拉取时被取走，**无丢失**；
+- `claimWithContent` 在 `linkWithRetry` **抛异常**时也会清理暂存文件（旧实现只在 `ok:false` 分支清理，
+  异常路径会残留 `tmp/<id>.<rand>.tmp`）。
+
 ---
 
 ## 快速开始
@@ -64,7 +98,9 @@ workbuddy-session-bridge/
 │   └── tools.js           # 8 个 MCP 工具的 schema 与分发
 ├── test/
 │   ├── smoke-test.js      # 零依赖冒烟测试（22 个用例）
-│   └── qa-verify.js       # 独立 QA 验证套件（80 个用例）
+│   ├── qa-verify.js       # 独立 QA 验证套件（83 个用例）
+│   ├── acceptance/        # 验收矩阵 F01~F13（15 组）
+│   └── helpers/           # fs 写 syscall 审计 preload 等（qa2-* 已退役存档）
 └── package.json           # 无 dependencies
 ```
 
@@ -109,8 +145,9 @@ stdio 传输 = **换行分隔的 JSON-RPC 2.0**（每行一个 JSON，无 `Conte
 | `workDir` | string | — | 按工作目录精确过滤（大小写不敏感） |
 | `includeCounts` | boolean | `true` | 是否统计 jsonl 行数 |
 
-返回：`{ indexReadable, indexPath, totalInIndex, returned, sessions: [{ conversationId, workDir, startedAt, resumedAt, messageCount, messageCountEstimated, sizeBytes, lastActivityAt, projectDir, fileExists }] }`
+返回：`{ indexReadable, indexSource, indexPath, indexError, indexVersion, indexUpdatedAt, indexFallback, totalInIndex, returned, limit, skippedInvalidIds, countMode, sessions: [{ conversationId, workDir, workDirSource, startedAt, resumedAt, messageCount, messageCountEstimated, sizeBytes, lastActivityAt, projectDir, filePath, resolvedVia, fileExists }] }`
 
+> `indexSource`：`"sessions.json"`（权威索引）或 `"project-scan"`（索引缺失时的目录扫描兜底，见上文平台差异）。
 > `messageCount`：文件 ≤ 4MB 时精确计数；更大时按尾部 512KB 采样外推，
 > 此时 `messageCountEstimated: true`。`lastActivityAt` 取 jsonl 的 mtime。
 
@@ -230,30 +267,59 @@ stdio 传输 = **换行分隔的 JSON-RPC 2.0**（每行一个 JSON，无 `Conte
 
 ## 配置示例
 
+> 下列示例给出 **Windows** 与 **macOS** 两种形态；`command` / `args` 必须是**本机绝对路径**，
+> 换机后请自行替换（跨平台无其他差异，代码已按 `os.homedir()` 动态解析路径）。
+
 ### (a) Codex CLI —— `~/.codex/config.toml`
 
+**Windows**
 ```toml
 [mcp_servers.workbuddy-session-bridge]
-command = "C:\\Users\\TinaD\\.workbuddy\\binaries\\node\\versions\\22.22.2-6\\node.exe"
-args = ["C:\\Users\\TinaD\\WorkBuddy\\2026-10-07-11-15-23\\workbuddy-session-bridge\\server.js"]
+command = "C:\\Users\\<用户名>\\.workbuddy\\binaries\\node\\versions\\22.22.2-6\\node.exe"
+args = ["C:\\Users\\<用户名>\\WorkBuddy\\2026-10-07-11-15-23\\workbuddy-session-bridge\\server.js"]
+```
+
+**macOS**（以下为本机实际部署路径，可直接抄）
+```toml
+[mcp_servers.workbuddy-session-bridge]
+command = "/Users/tinadong7036/.workbuddy/binaries/node/versions/22.22.2-6/bin/node"
+args = ["/Users/tinadong7036/Documents/开发项目/workbuddy连接器/workbuddy-session-bridge/server.js"]
 
 [mcp_servers.workbuddy-session-bridge.env]
-# 可选：把队列**根目录**指到别处（默认 %USERPROFILE%\.workbuddy\task-bridge）
+# 可选：把队列**根目录**指到别处（默认 <HOME>/.workbuddy/task-bridge）
 # 注意：WB_BRIDGE_STORE 是**目录**，不是 .json 文件；指向 .json 或已存在文件会被拒绝（STORE_CONFIG_INVALID）。
-# WB_BRIDGE_STORE = "C:\\Users\\TinaD\\.workbuddy\\task-bridge"
+# WB_BRIDGE_STORE = "/Users/<用户名>/.workbuddy/task-bridge"
 # 可选：设为 "0" 关闭 stderr 诊断日志
 # WB_BRIDGE_LOG = "1"
 ```
 
-### (b) WorkBuddy —— `C:\Users\TinaD\.workbuddy\mcp.json`
+### (b) WorkBuddy —— `~/.workbuddy/mcp.json`（Windows `C:\Users\<用户名>\.workbuddy\mcp.json`）
 
+**Windows**
 ```json
 {
   "mcpServers": {
     "workbuddy-session-bridge": {
-      "command": "C:\\Users\\TinaD\\.workbuddy\\binaries\\node\\versions\\22.22.2-6\\node.exe",
+      "command": "C:\\Users\\<用户名>\\.workbuddy\\binaries\\node\\versions\\22.22.2-6\\node.exe",
       "args": [
-        "C:\\Users\\TinaD\\WorkBuddy\\2026-10-07-11-15-23\\workbuddy-session-bridge\\server.js"
+        "C:\\Users\\<用户名>\\WorkBuddy\\2026-10-07-11-15-23\\workbuddy-session-bridge\\server.js"
+      ],
+      "env": {
+        "WB_BRIDGE_LOG": "1"
+      }
+    }
+  }
+}
+```
+
+**macOS**（以下为本机实际部署路径，可直接抄）
+```json
+{
+  "mcpServers": {
+    "workbuddy-session-bridge": {
+      "command": "/Users/tinadong7036/.workbuddy/binaries/node/versions/22.22.2-6/bin/node",
+      "args": [
+        "/Users/tinadong7036/Documents/开发项目/workbuddy连接器/workbuddy-session-bridge/server.js"
       ],
       "env": {
         "WB_BRIDGE_LOG": "1"
@@ -264,6 +330,8 @@ args = ["C:\\Users\\TinaD\\WorkBuddy\\2026-10-07-11-15-23\\workbuddy-session-bri
 ```
 
 > 两个进程必须指向**同一个**队列根目录，队列才闭环。默认路径相同即满足。
+>
+> macOS 实测（2026-10-14）：`~/.workbuddy/mcp.json` 写入上述配置、重启客户端后工具即生效。
 
 ---
 
@@ -372,8 +440,21 @@ args = ["C:\\Users\\TinaD\\WorkBuddy\\2026-10-07-11-15-23\\workbuddy-session-bri
 
 ## 测试
 
+三套测试，全部零依赖、写操作全部隔离到系统临时目录：
+
 ```bash
-"C:\Users\TinaD\.workbuddy\binaries\node\versions\22.22.2-6\node.exe" test/smoke-test.js
+node test/smoke-test.js              # 冒烟（22 用例）
+node test/qa-verify.js               # 独立 QA 验证套件（83 用例）
+node test/acceptance/run-all.js      # 验收矩阵 F01~F13（15 组，约 3~5 分钟）
+```
+
+三套都支持 `WB_REAL_WB=<dir>` 指定真实部署目录；默认取 `os.homedir()/.workbuddy`（跨平台自适应）。
+
+```bash
+# Windows
+"C:\Users\<用户名>\.workbuddy\binaries\node\versions\22.22.2-6\node.exe" test/smoke-test.js
+# macOS
+/Users/<用户名>/.workbuddy/binaries/node/versions/22.22.2-6/bin/node test/smoke-test.js
 ```
 
 22 个用例，覆盖：`initialize` → `tools/list`（断言 8 个工具名与 schema）→ 逐个 `tools/call` →
@@ -392,5 +473,16 @@ args = ["C:\\Users\\TinaD\\WorkBuddy\\2026-10-07-11-15-23\\workbuddy-session-bri
 `%TEMP%\wb-session-bridge-smoke\`，**不向任何真实 WorkBuddy 目录写入**；
 只读访问真实 `sessions.json` 与**至多 1 个**真实会话 jsonl。
 
-另有 QA 独立验证脚本 `test/qa-verify.js`（80 用例，零依赖，与本 smoke-test 无共享代码），
+另有 QA 独立验证脚本 `test/qa-verify.js`（83 用例，零依赖，与本 smoke-test 无共享代码），
 覆盖 syscall 级写入边界审计、协议合规、并发原子性（含**并发领取唯一性**与**状态机无重复**）、缺陷回归。
+
+> **真实数据用例的门禁（跨平台）**：部分用例的前置条件依赖本机真实部署，按需拆分门禁，
+> **缺失时记 SKIP 并打印精确原因，绝不伪装通过、绝不改弱断言**：
+>
+> | 门禁 | 条件 | 典型用例 |
+> | --- | --- | --- |
+> | 只需真实会话文件 | `projects/` 下有可读 `*.jsonl` | A2-5 越级拦截、A3-1/A3-2 附加块剥离、F4 `fileExists`/`messageCount` |
+> | 需要索引路径语义 | 额外要求 `app/sessions.json` 存在 | A4-1 slug 逐一比对、A4-5 / F3 `resolvedVia='sessions.json'` |
+>
+> 真实素材（项目目录、会话 ID）在运行时**发现**，不硬编码任何机器的路径。macOS 现状：
+> 83 用例 → PASS 79 / FAIL 0 / SKIP 3（3 个均为「需要索引路径语义」，Mac 不生成 `sessions.json`）/ ENV 1。

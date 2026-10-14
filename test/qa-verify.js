@@ -8,7 +8,7 @@
  *
  * 隔离原则：
  *   - 所有写操作经 WB_BRIDGE_STORE（**目录**语义）指向 %TEMP% 下独立目录。
- *   - 真实 WorkBuddy 目录（默认 C:\Users\TinaD\.workbuddy，可用 WB_REAL_WB 覆盖）全程
+ *   - 真实 WorkBuddy 目录（默认 `~/.workbuddy`，跨平台自适应；可用 WB_REAL_WB 覆盖）全程
  *     **只读**，任何用例都不得写它。
  *   - 默认写路径用例（A1-1）通过 WB_WORKBUDDY_DIR 把 WorkBuddy 根重定向到一个本次
  *     mkdtemp 创建的隔离目录，因此**完全不触碰真实用户目录**（F01 整改）。
@@ -360,27 +360,181 @@ function readMaildir(storeRoot) {
  * 真实 WorkBuddy 布局（只读）
  * ------------------------------------------------------------------ */
 
-const REAL_WB = process.env.WB_REAL_WB || 'C:\\Users\\TinaD\\.workbuddy';
+const REAL_WB = process.env.WB_REAL_WB || path.join(os.homedir(), '.workbuddy');
 /** 真实部署的关键路径（只读）：项目会话目录 + 会话索引。 */
 const REAL_WB_PROJECTS = path.join(REAL_WB, 'projects');
 const REAL_WB_INDEX = path.join(REAL_WB, 'app', 'sessions.json');
 
 /**
- * 是否具备真实 WorkBuddy 部署（决定依赖真实数据的用例是「真实执行」还是「SKIP」）。
+ * 只读枚举真实 projects/ 下的会话（供需要「任意真实会话」的用例动态选材）。
  *
- * 注意：**不能**只用 `fs.existsSync(REAL_WB)` —— 一个**空的**目录同样「存在」，
- * 但其中没有任何真实数据；team-lead 的要求是「指向空目录 = 无真实部署」。
- * 故以「projects/ 与 sessions.json 二者俱在」作为真实部署的判据（保守：缺任一项即视为无部署）。
+ * 【M3 修复 · 测试跨平台】旧用例把 WinPC 专属的项目目录名（`c-Users-TinaD-WorkBuddy-2026-08-24-…`）
+ * 与真实会话 ID 硬编码在断言里，换机（Mac）后必然取不到，只能整例跳过。
+ * 改为在运行时**发现**真实素材，使同一条断言在任何平台上都真正执行。
+ *
+ * @return {Array<{slug: string, projectDir: string, conversationId: string, filePath: string}>} 会话清单。
  */
-const HAS_REAL_DEPLOY = fs.existsSync(REAL_WB_PROJECTS) && fs.existsSync(REAL_WB_INDEX);
+function discoverRealSessions() {
+  const found = [];
+  let dirs = [];
+  try {
+    dirs = fs.readdirSync(REAL_WB_PROJECTS, { withFileTypes: true }).filter((e) => e.isDirectory());
+  } catch (_error) {
+    return found;
+  }
+  for (const dirEntry of dirs) {
+    const projectDir = path.join(REAL_WB_PROJECTS, dirEntry.name);
+    let files = [];
+    try {
+      files = fs.readdirSync(projectDir).filter((f) => f.toLowerCase().endsWith('.jsonl'));
+    } catch (_error) {
+      continue;
+    }
+    for (const file of files) {
+      found.push({
+        slug: dirEntry.name,
+        projectDir,
+        conversationId: file.slice(0, -'.jsonl'.length),
+        filePath: path.join(projectDir, file),
+      });
+    }
+  }
+  return found;
+}
+
+/** 真实会话清单（惰性一次性扫描，只读）。 */
+const REAL_SESSIONS = discoverRealSessions();
 
 /**
- * 真实部署缺失时的统一跳过原因（写明前置条件与恢复方式）。
+ * 真实部署 `task-bridge` 队列的只读快照（存在性 + 递归条目集合 + 各文件大小）。
+ *
+ * 【M3 修复】旧断言写作「该目录必须**不存在**」，但连接器的**默认**队列根就是
+ * `<WORKBUDDY_DIR>/task-bridge` —— 真实部署本来就会创建它（Mac 上实测已存在）。
+ * 「目录不存在」并不是本组要守的不变量；真正要守的是「本套件**零触碰**真实目录」。
+ * 故改为套件运行前后快照比对：存在性、条目集合、各条目大小任一变化即判失败。
+ *
+ * 只读：仅 `stat` / `readdir`，不创建、不写入、不删除。
+ *
+ * @param {string} dir 目录。
+ * @return {{exists: boolean, entries: string[]}} 快照。
  */
+function snapshotDir(dir) {
+  const snapshot = { exists: false, entries: [] };
+  let stats = null;
+  try {
+    stats = fs.statSync(dir);
+  } catch (_error) {
+    return snapshot;
+  }
+  if (!stats.isDirectory()) return snapshot;
+  snapshot.exists = true;
+  const walk = (base, rel) => {
+    let items = [];
+    try {
+      items = fs.readdirSync(base, { withFileTypes: true });
+    } catch (_error) {
+      return;
+    }
+    for (const item of items) {
+      const abs = path.join(base, item.name);
+      const entryRel = rel ? `${rel}/${item.name}` : item.name;
+      if (item.isDirectory()) {
+        walk(abs, entryRel);
+        continue;
+      }
+      let fileStats = null;
+      try {
+        fileStats = fs.statSync(abs);
+      } catch (_error) {
+        fileStats = null;
+      }
+      snapshot.entries.push(`${entryRel}|${fileStats ? fileStats.size : '?'}`);
+    }
+  };
+  walk(dir, '');
+  snapshot.entries.sort();
+  return snapshot;
+}
+
+/** 真实队列根（连接器默认 store）。 */
+const REAL_TASK_BRIDGE = path.join(REAL_WB, 'task-bridge');
+/** 套件启动时的真实队列快照（用于 G1/G2 的前后比对）。 */
+const REAL_TASK_BRIDGE_BEFORE = snapshotDir(REAL_TASK_BRIDGE);
+/** 套件启动时的真实 projects/ 顶层目录名快照。 */
+const REAL_PROJECTS_BEFORE = (() => {
+  try {
+    return fs.readdirSync(REAL_WB_PROJECTS).sort();
+  } catch (_error) {
+    return null;
+  }
+})();
+
+/**
+ * 挑一个**确实含 `<system-reminder>` 附加块**的真实会话（取文件头部 64KB 探测）。
+ *
+ * @return {(Object|null)} 会话条目；找不到返回 null。
+ */
+function pickSessionWithSystemReminder() {
+  for (const item of REAL_SESSIONS) {
+    let head = '';
+    try {
+      const fd = fs.openSync(item.filePath, 'r');
+      try {
+        const buf = Buffer.alloc(65536);
+        const read = fs.readSync(fd, buf, 0, 65536, 0);
+        head = buf.slice(0, read).toString('utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch (_error) {
+      continue;
+    }
+    if (head.includes('<system-reminder')) return item;
+  }
+  return null;
+}
+
+/** 真实 projects/ 下是否存在可用会话数据。 */
+const HAS_REAL_PROJECTS = REAL_SESSIONS.length > 0;
+/** 真实 sessions.json 索引是否可用。 */
+const HAS_REAL_INDEX = fs.existsSync(REAL_WB_INDEX);
+
+/**
+ * 是否具备**完整**真实 WorkBuddy 部署（projects/ 与 sessions.json 二者俱在）。
+ *
+ * 注意：**不能**只用 `fs.existsSync(REAL_WB)` —— 一个**空的**目录同样「存在」，
+ * 但其中没有任何真实数据；故以「projects/ 与 sessions.json 二者俱在」作为完整部署的判据。
+ *
+ * 但**并非所有**真实数据用例都需要索引：Mac 客户端不生成 `app/sessions.json`，
+ * 而 `projects/<slug>/*.jsonl` 照常存在且可读。故门禁按用例的真实前置条件拆分：
+ *   - 只需真实会话文件   → `HAS_REAL_PROJECTS`
+ *   - 需要索引路径语义   → `HAS_REAL_INDEX`
+ */
+const HAS_REAL_DEPLOY = HAS_REAL_PROJECTS && HAS_REAL_INDEX;
+
+/** 真实部署完全缺失时的统一跳过原因。 */
 const SKIP_NO_REAL_DEPLOY =
   `本机无真实 WorkBuddy 部署数据（REAL_WB=${REAL_WB} 不存在、或为空目录/缺 projects、sessions.json）；` +
   '按审计 §7「可移植功能测试应与真实部署验收分开」跳过；' +
   '在本机默认环境或设 WB_REAL_WB 指向真实部署目录后，本用例会真实执行（断言不弱化）。';
+
+/** 缺真实会话文件时的跳过原因（只需 projects/ 的用例）。 */
+const SKIP_NO_REAL_PROJECTS =
+  `本机 ${REAL_WB_PROJECTS} 下没有可读的会话 jsonl（REAL_WB=${REAL_WB}）；` +
+  '本用例只需真实会话文件、不需要 sessions.json 索引；' +
+  '设 WB_REAL_WB 指向含 projects/ 的真实部署目录后即会真实执行（断言不弱化）。';
+
+/**
+ * 缺 sessions.json 索引时的跳过原因。
+ *
+ * 本连接器已支持「索引缺失 → 只读目录扫描」兜底（见 lib/sessions.js），但**本组用例断言的是
+ * 索引路径本身的语义**（slug 命中、resolvedVia='sessions.json'），扫描兜底无法替代该断言，
+ * 故仍如实跳过，而不是把断言改弱成「能读到就算过」。
+ */
+const SKIP_NO_REAL_INDEX =
+  `本机缺 sessions.json 索引（${REAL_WB_INDEX} 不存在；Mac 客户端不生成该文件）；` +
+  '本组用例断言的是**索引路径语义**（slug 命中 / resolvedVia=sessions.json），扫描兜底不能替代该断言，' +
+  '故如实跳过而不改弱断言；在 WinPC 或设 WB_REAL_WB 指向含 app/sessions.json 的部署后可真实执行。';
 
 /**
  * 在「真实部署 = WorkBuddy 根」的进程内环境下运行 fn（临时设置 WB_WORKBUDDY_DIR）。
@@ -655,16 +809,16 @@ async function groupA() {
   });
 
   await check('A2-5 【已修复】conversationId 越级路径被拦截，读不到 projects/ 之外的 .jsonl', async () => {
-    if (!HAS_REAL_DEPLOY) skipCase(SKIP_NO_REAL_DEPLOY);
+    if (!HAS_REAL_PROJECTS) skipCase(SKIP_NO_REAL_PROJECTS);
     const sb = sandbox('a2-path-checks');
     const outsideFile = path.join(sb.dir, 'outside', 'outside.jsonl');
     fs.mkdirSync(path.dirname(outsideFile), { recursive: true });
     fs.writeFileSync(outsideFile,
       JSON.stringify({ type: 'message', role: 'user', content: [{ type: 'text', text: TEST_MARK }] }) + '\n', 'utf8');
 
-    const realSlugDir = fs.readdirSync(path.join(REAL_WB, 'projects')).find((d) => d.startsWith('c-Users-TinaD-WorkBuddy-2026-08-24-13-40-25'));
-    assert.ok(realSlugDir, '找不到用于构造越级路径的真实项目目录');
-    const projectDir = path.join(REAL_WB, 'projects', realSlugDir);
+    // 【M3】真实项目目录改为运行时发现，不再硬编码 WinPC 目录名。
+    const fixture = REAL_SESSIONS[0];
+    const projectDir = fixture.projectDir;
     const cid = path.relative(projectDir, outsideFile).replace(/\.jsonl$/, '');
     assert.ok(cid.includes('..'), '越级路径构造失败');
 
@@ -688,7 +842,11 @@ async function groupA() {
     const txt = path.join(sb.dir, 'outside', 'secret.txt');
     fs.mkdirSync(path.dirname(txt), { recursive: true });
     fs.writeFileSync(txt, 'PLAINTEXT-MARK-77ab', 'utf8');
-    const projectDir = path.join(REAL_WB, 'projects', 'c-Users-TinaD-WorkBuddy-2026-08-24-13-40-25');
+    // 【M3】基准项目目录改为运行时发现（有真实会话时用真实目录，否则退回纯相对路径构造）。
+    const baseProjectDir = HAS_REAL_PROJECTS
+      ? REAL_SESSIONS[0].projectDir
+      : path.join(REAL_WB_PROJECTS, 'nonexistent-project');
+    const projectDir = baseProjectDir;
     // 只能命中 <path>.jsonl
     const cid = path.relative(projectDir, txt).replace(/\.txt$/, '.jsonl');
     const client = new RawClient({ env: sb.env });
@@ -711,7 +869,10 @@ async function groupA() {
     fs.writeFileSync(path.join(outsideConv, 'subagents', 'agent-x.jsonl'),
       JSON.stringify({ type: 'message', role: 'user', content: 'SUBAGENT-MARK-5511' }) + '\n', 'utf8');
     void fakeRoot;
-    const projectDir = path.join(REAL_WB, 'projects', 'c-Users-TinaD-WorkBuddy-2026-08-24-13-40-25');
+    // 【M3】基准项目目录改为运行时发现。
+    const projectDir = HAS_REAL_PROJECTS
+      ? REAL_SESSIONS[0].projectDir
+      : path.join(REAL_WB_PROJECTS, 'nonexistent-project');
     // 指向该外部目录下的 <convId>.jsonl（不存在）——确认不会因越级而崩溃即可
     const cid = path.relative(projectDir, path.join(outsideConv, 'nope')).replace(/\.jsonl$/, '');
     const client = new RawClient({ env: sb.env });
@@ -727,14 +888,16 @@ async function groupA() {
 
   // --- A3: 附加块处理 ---
   await check('A3-1 includeSystemReminders=true 返回原文；默认 false 剥离系统附加块（仅检查 messages）', async () => {
-    if (!HAS_REAL_DEPLOY) skipCase(SKIP_NO_REAL_DEPLOY);
+    if (!HAS_REAL_PROJECTS) skipCase(SKIP_NO_REAL_PROJECTS);
+    // 【M3】不再硬编码 WinPC 的真实会话 ID：运行时挑一个确实含 <system-reminder> 的真实会话。
+    const fixture = pickSessionWithSystemReminder();
+    if (!fixture) skipCase(`真实 projects/ 下的会话文件头部 64KB 内均未出现 <system-reminder>（REAL_WB=${REAL_WB}）；本用例需要含附加块的真实会话作为素材。`);
     const sb = sandbox('a3-reminder');
-    // 显式把服务端指向 REAL_WB，使其与 HAS_REAL_DEPLOY 的测量对象一致（不受 HOME 重定向影响）。
+    // 显式把服务端指向 REAL_WB，使其与真实素材的测量对象一致（不受 HOME 重定向影响）。
     const client = new RawClient({ env: { ...sb.env, WB_WORKBUDDY_DIR: REAL_WB } });
     try {
-      // 该真实会话的 <system-reminder> 只出现在第 1 条消息（index 0），
-      // 因此必须读全量（maxMessages 设大），否则尾部窗口取不到。
-      const realId = 'ef8a2f20-d32d-40ae-a66b-7b715b9ca0ab';
+      // <system-reminder> 通常只出现在首条消息，故必须读全量（maxMessages 设大），否则尾部窗口取不到。
+      const realId = fixture.conversationId;
       const args = { conversationId: realId, maxMessages: 1000, maxChars: 500000 };
       const on = await client.call('wb_read_session', { ...args, includeSystemReminders: true });
       const off = await client.call('wb_read_session', { ...args, includeSystemReminders: false });
@@ -748,26 +911,27 @@ async function groupA() {
       const onLen = on.payload.messages.reduce((s, m) => s + m.textLength, 0);
       const offLen = off.payload.messages.reduce((s, m) => s + m.textLength, 0);
       assert.ok(onLen > offLen, `开启后文本未变多：on=${onLen} off=${offLen}`);
-      return `全量 ${on.payload.messages.length} 条：on 文本 ${onLen} 字符 / off ${offLen} 字符，剥离 ${off.payload.removedSystemReminderMessages} 条`;
+      return `${fixture.conversationId}（slug=${fixture.slug}）：全量 ${on.payload.messages.length} 条，on ${onLen} 字符 / off ${offLen} 字符，剥离 ${off.payload.removedSystemReminderMessages} 条`;
     } finally {
       client.close();
     }
   });
 
   await check('A3-2 剥离后不残留 identity 敏感标记（SOUL.md/IDENTITY.md/USER.md 路径）', async () => {
-    if (!HAS_REAL_DEPLOY) skipCase(SKIP_NO_REAL_DEPLOY);
+    if (!HAS_REAL_PROJECTS) skipCase(SKIP_NO_REAL_PROJECTS);
+    const fixture = REAL_SESSIONS[0];
     const sb = sandbox('a3-strip');
     const client = new RawClient({ env: { ...sb.env, WB_WORKBUDDY_DIR: REAL_WB } });
     try {
       const r = await client.call('wb_read_session', {
-        conversationId: 'ef8a2f20-d32d-40ae-a66b-7b715b9ca0ab',
+        conversationId: fixture.conversationId,
         maxMessages: 3, maxChars: 200000, includeSystemReminders: false,
       });
       const text = r.raw.content[0].text;
       // identity 文件内容整体位于 <system-reminder> 内，默认剥离后不应出现其正文标记。
       const bodyHasSoul = /# SOUL\.md - Who You Are/.test(text);
       assert.ok(!bodyHasSoul, '默认返回中仍含 SOUL.md 正文，剥离不彻底');
-      return 'SOUL.md 正文未出现';
+      return `SOUL.md 正文未出现（素材 ${fixture.conversationId}）`;
     } finally {
       client.close();
     }
@@ -805,9 +969,9 @@ async function groupA() {
 
   // --- A4: slug 规则 ---
   await check('A4-1 slugifyPath 输出与真实 projects/ 目录名逐一比对（真实数据）', () => {
-    if (!HAS_REAL_DEPLOY) skipCase(SKIP_NO_REAL_DEPLOY);
-    const projectsDir = path.join(REAL_WB, 'projects');
-    const index = JSON.parse(fs.readFileSync(path.join(REAL_WB, 'app', 'sessions.json'), 'utf8'));
+    if (!HAS_REAL_INDEX) skipCase(SKIP_NO_REAL_INDEX);
+    const projectsDir = REAL_WB_PROJECTS;
+    const index = JSON.parse(fs.readFileSync(REAL_WB_INDEX, 'utf8'));
     const checked = [];
     for (const entry of index.sessions) {
       if (typeof entry.workDir !== 'string') continue;
@@ -823,20 +987,28 @@ async function groupA() {
   });
 
   await check('A4-2 中文/空格/盘符路径 slug 与 WorkBuddy 真实命名一致', () => {
-    if (!HAS_REAL_DEPLOY) skipCase(SKIP_NO_REAL_DEPLOY);
-    const projectsDir = path.join(REAL_WB, 'projects');
-    const realDirs = fs.readdirSync(projectsDir);
-    // 用真实存在的目录反推：取含中文的目录，验证「单破折号」规则可复现它。
-    const cn = realDirs.filter((d) => /[一-龥]/.test(d));
-    assert.ok(cn.length > 0, '真实数据中没有中文目录，无法验证');
-    // WorkBuddy 的真实规则：盘符+冒号+首个反斜杠 -> 单个 '-'
+    // 【M3】拆分：规则断言（纯单元）恒执行；「与真实目录名比对」部分仅在真实素材可用时执行。
+    // 旧实现把整例门禁在「WinPC 特定目录名存在」上，换机后连**规则本身**都没被验证过。
     const sample = 'D:\\OneDrive\\4、董娣相关\\4、专利知识库';
     const expected = 'd-OneDrive-4、董娣相关-4、专利知识库';
-    assert.ok(cn.includes(expected), `真实目录中找不到 ${expected}`);
     const got = paths.slugifyPath(sample);
     assert.strictEqual(got, expected,
       `中文路径 slug 不符：期望 ${expected}，实际 ${got}（冒号与反斜杠各产生一个 '-'）`);
-    return `中文路径 OK：${got}`;
+
+    if (!HAS_REAL_PROJECTS) {
+      return `规则断言通过（${sample} -> ${got}）；本机无真实 projects/ 素材，跳过与真实目录名的比对`;
+    }
+    const realDirs = fs.readdirSync(REAL_WB_PROJECTS);
+    const cn = realDirs.filter((d) => /[一-龥]/.test(d));
+    assert.ok(cn.length > 0, '真实数据中没有中文目录，无法验证');
+    // 真实素材若恰好包含该样例目录（WinPC 部署），额外做一次「规则可复现真实目录名」的强断言。
+    if (cn.includes(expected)) {
+      return `规则断言通过 + 真实目录命中：${got}`;
+    }
+    // Mac 等部署下目录名不同：改为对**每个真实中文目录**做「无双破折号」不变量校验。
+    const doubled = cn.filter((d) => d.includes('--'));
+    assert.strictEqual(doubled.length, 0, `真实中文目录名含双破折号（slug 规则可能回退）: ${doubled.join(', ')}`);
+    return `规则断言通过（${got}）；本机 ${cn.length} 个真实中文目录名均无双破折号（无 WinPC 样例目录，未做同名字符串比对）`;
   });
 
   await check('A4-3 正斜杠路径归一化后仍产生双破折号（同一 bug 面）', () => {
@@ -854,7 +1026,7 @@ async function groupA() {
   });
 
   await check('A4-5 【已修复】resolveSession 走 sessions.json 索引路径命中（slug 修复后不再依赖扫描兜底）', () => {
-    if (!HAS_REAL_DEPLOY) skipCase(SKIP_NO_REAL_DEPLOY);
+    if (!HAS_REAL_INDEX) skipCase(SKIP_NO_REAL_INDEX);
     return withRealWorkbuddyDir(() => {
       const sb = sandbox('a4-scan');
       process.env.WB_BRIDGE_STORE = sb.store;
@@ -2173,16 +2345,20 @@ async function groupE() {
     // README 的 TOML/JSON 片段里反斜杠是转义的（两个反斜杠），先归一为单反斜杠再解析路径。
     const unescaped = readme.replace(/\\\\/g, '\\');
     const grab = (re) => [...unescaped.matchAll(re)].map((m) => m[0]);
-    const nodePaths = grab(/[A-Za-z]:\\[^\s"',\]]*node\.exe/g);
-    const serverPaths = grab(/[A-Za-z]:\\[^\s"',\]]*server\.js/g);
+    // 【M3】同时支持 Windows（`C:\…\node.exe`）与 POSIX（`/Users/…/bin/node`）两种绝对路径片段。
+    const absTokens = grab(/(?:[A-Za-z]:\\|\/)[^\s"',\]]*/g);
+    const nodePaths = absTokens.filter((t) => /(?:^|[\\/])node(?:\.exe)?$/.test(t));
+    const serverPaths = absTokens.filter((t) => /(?:^|[\\/])server\.js$/.test(t));
+    /** 取路径 basename（自动按分隔符判断 win32 / posix 语义）。 */
+    const baseNameOf = (p) => path.win32.basename(p);
 
     // (1) args = server.js：basename 必须是 server.js；把「项目目录段之后的尾部」
     //     重定根（re-root）到**当前实际项目目录**——原部署位置、审计包副本位置都能通过；
     //     若 README 写错文件名（如 server.mjs），serverPaths 为空，此处直接 FAIL（保持判别力）。
-    assert.ok(serverPaths.length >= 1, 'README 片段未包含任何 "...\\server.js" 绝对路径（args）');
+    assert.ok(serverPaths.length >= 1, 'README 片段未包含任何 "...\\server.js" 或 ".../server.js" 绝对路径（args）');
     const PROJ_SEGMENT = 'workbuddy-session-bridge'; // README 中固定的项目目录段
     for (const raw of serverPaths) {
-      assert.strictEqual(path.win32.basename(raw), 'server.js', `args 指向的不是 server.js: ${raw}`);
+      assert.strictEqual(baseNameOf(raw), 'server.js', `args 指向的不是 server.js: ${raw}`);
       const segs = raw.split(/[\\/]+/).filter((s) => s.length > 0);
       const idx = segs.lastIndexOf(PROJ_SEGMENT);
       assert.ok(idx >= 0 && idx < segs.length - 1, `args 路径未包含项目目录段 "${PROJ_SEGMENT}": ${raw}`);
@@ -2190,21 +2366,21 @@ async function groupE() {
       assert.ok(fs.existsSync(relocated), `重定根后路径不存在（README 可能写错文件名/结构）: ${relocated}`);
     }
 
-    // (2) command = node.exe：绝对路径 + basename=node.exe 是硬断言；
+    // (2) command = node：绝对路径 + basename=node(.exe) 是硬断言；
     //     「本机是否存在」属环境差异（不同机器 Node 安装路径不同）——全部缺失则记 ENV，
-    //     既不直接 FAIL，也不伪装 PASS。toml 与 mcp.json 两个片段都覆盖。
-    assert.ok(nodePaths.length >= 1, 'README 片段未包含任何 "...\\node.exe" 绝对路径（command）');
+    //     既不直接 FAIL，也不伪装 PASS。toml 与 mcp.json 两个片段、两个平台都覆盖。
+    assert.ok(nodePaths.length >= 1, 'README 片段未包含任何 "...\\node.exe" 或 ".../bin/node" 绝对路径（command）');
     const missingNode = [];
     for (const raw of nodePaths) {
-      assert.ok(/^[A-Za-z]:[\\/]/.test(raw), `command 不是绝对路径: ${raw}`);
-      assert.strictEqual(path.win32.basename(raw), 'node.exe', `command 指向的不是 node.exe: ${raw}`);
+      assert.ok(/^(?:[A-Za-z]:[\\/]|\/)/.test(raw), `command 不是绝对路径: ${raw}`);
+      assert.ok(baseNameOf(raw) === 'node' || baseNameOf(raw) === 'node.exe', `command 指向的不是 node/node.exe: ${raw}`);
       if (!fs.existsSync(raw)) missingNode.push(raw);
     }
     if (missingNode.length === nodePaths.length) {
-      raiseEnv(`README 片段中的 node.exe 绝对路径在本机均不存在（不同机器 Node 安装路径不同）: ${missingNode[0]}`);
+      raiseEnv(`README 片段中的 node 绝对路径在本机均不存在（不同机器 Node 安装路径不同）: ${missingNode[0]}`);
     }
-    const nodeNote = missingNode.length ? `；${missingNode.length}/${nodePaths.length} 个 node.exe 本机缺失（ENV 容忍）` : '';
-    return `重定根校验 ${serverPaths.length} 个 server.js 均存在；node.exe 绝对路径 ${nodePaths.length} 个 basename 合法${nodeNote}`;
+    const nodeNote = missingNode.length ? `；${missingNode.length}/${nodePaths.length} 个 node 路径本机缺失（ENV 容忍）` : '';
+    return `重定根校验 ${serverPaths.length} 个 server.js 均存在；node 绝对路径 ${nodePaths.length} 个 basename 合法${nodeNote}`;
   });
 
   await check('E13-3 README 声称的 mcp.json 位置存在且为合法 JSON', () => {
@@ -2419,7 +2595,7 @@ async function groupF() {
   });
 
   await check('F3 【已修复】workDir 索引路径命中（slug 双破折号已修，无需扫描兜底）', () => {
-    if (!HAS_REAL_DEPLOY) skipCase(SKIP_NO_REAL_DEPLOY);
+    if (!HAS_REAL_INDEX) skipCase(SKIP_NO_REAL_INDEX);
     return withRealWorkbuddyDir(() => {
       const layout = paths.resolveLayout();
       const index = sessionsMod.loadSessionIndex(layout);
@@ -2439,7 +2615,8 @@ async function groupF() {
   });
 
   await check('F4 【已修复】wb_list_sessions 的 fileExists / messageCount 反映真实文件状态', async () => {
-    if (!HAS_REAL_DEPLOY) skipCase(SKIP_NO_REAL_DEPLOY);
+    // 【M3】只需真实会话文件：Mac 无 sessions.json 时走目录扫描兜底，fileExists/messageCount 同样须为真。
+    if (!HAS_REAL_PROJECTS) skipCase(SKIP_NO_REAL_PROJECTS);
     // 显式把服务端指向 REAL_WB，使其与 HAS_REAL_DEPLOY 的测量对象一致（不受 HOME 重定向影响）。
     const client = new RawClient({ env: { TASK: '1', WB_BRIDGE_STORE: sandbox('f4-list').store, WB_BRIDGE_LOG: '0', WB_WORKBUDDY_DIR: REAL_WB } });
     try {
@@ -2459,14 +2636,14 @@ async function groupF() {
   });
 
   await check('F5 【已修复】slugifyPath 盘符冒号与反斜杠合并为单个 "-"', () => {
-    if (!HAS_REAL_DEPLOY) skipCase(SKIP_NO_REAL_DEPLOY);
+    if (!HAS_REAL_PROJECTS) skipCase(SKIP_NO_REAL_PROJECTS);
     const input = 'C:\\Users\\TinaD';
     const got = paths.slugifyPath(input);
     const expected = 'c-Users-TinaD';
     assert.strictEqual(got, expected, `slug 修复回退了：got=${got}，期望=${expected}`);
     assert.ok(!got.includes('--'), `仍含双破折号：${got}`);
     // 反向：真实目录名不得含双破折号。
-    const realDirs = fs.readdirSync(path.join(REAL_WB, 'projects'));
+    const realDirs = fs.readdirSync(REAL_WB_PROJECTS);
     const bad = realDirs.filter((d) => d.includes('--'));
     assert.strictEqual(bad.length, 0, `真实目录名含双破折号: ${bad.join(', ')}`);
     return `已修复：'${input}' -> '${got}'；${realDirs.length} 个真实目录名均无双破折号`;
@@ -2500,16 +2677,27 @@ async function main() {
   // 注意：不能用「整轮前后 mtime 快照」判断只读——WorkBuddy 桌面端自身会持续写
   // .workbuddy（logs/*.log、workbuddy.db-wal、app/memory/polling-lease-*.json 等）。
   // 写入边界由 A1 组 syscall 审计 + D12-2 只读快照给出确定性证据。
-  await check('G1 真实 .workbuddy/task-bridge 从未被创建（全程零触碰真实目录）', () => {
-    const realTaskBridge = path.join(REAL_WB, 'task-bridge');
-    assert.ok(!fs.existsSync(realTaskBridge), `真实目录出现 task-bridge: ${realTaskBridge}（不应发生）`);
-    return '真实 .workbuddy/task-bridge 不存在';
+  await check('G1 真实 .workbuddy/task-bridge 未被本套件创建或改动（全程零触碰真实目录）', () => {
+    const after = snapshotDir(REAL_TASK_BRIDGE);
+    assert.strictEqual(after.exists, REAL_TASK_BRIDGE_BEFORE.exists,
+      `真实队列根存在性发生变化：before=${REAL_TASK_BRIDGE_BEFORE.exists} after=${after.exists}（${REAL_TASK_BRIDGE}）`);
+    assert.deepStrictEqual(after.entries, REAL_TASK_BRIDGE_BEFORE.entries,
+      `真实队列根内容被改动：\n  before=${JSON.stringify(REAL_TASK_BRIDGE_BEFORE.entries)}\n  after =${JSON.stringify(after.entries)}`);
+    return REAL_TASK_BRIDGE_BEFORE.exists
+      ? `真实队列根已存在（默认 store），但其 ${after.entries.length} 个条目在套件全程未被创建/改动/删除`
+      : '真实 .workbuddy/task-bridge 不存在，套件全程未创建它';
   });
 
   await check('G2 真实 WorkBuddy 数据源未被本套件写入', () => {
-    const bridgeDir = path.join(REAL_WB, 'task-bridge');
-    assert.ok(!fs.existsSync(bridgeDir), '真实目录残留 task-bridge');
-    return '真实目录无本套件产物';
+    const after = snapshotDir(REAL_TASK_BRIDGE);
+    assert.deepStrictEqual(after.entries, REAL_TASK_BRIDGE_BEFORE.entries,
+      '真实队列根出现本套件产物（entries 快照不一致）');
+    if (REAL_PROJECTS_BEFORE !== null) {
+      const projectsAfter = fs.readdirSync(REAL_WB_PROJECTS).sort();
+      assert.deepStrictEqual(projectsAfter, REAL_PROJECTS_BEFORE,
+        `真实 projects/ 顶层目录集合被改动：\n  before=${JSON.stringify(REAL_PROJECTS_BEFORE)}\n  after =${JSON.stringify(projectsAfter)}`);
+    }
+    return '真实目录无本套件产物（队列 + projects/ 快照前后一致）';
   });
 
   await check('G3 【F01】哨兵文件全程未被删除/改写（清理边界安全）', () => {
