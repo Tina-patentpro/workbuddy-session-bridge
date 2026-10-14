@@ -1,0 +1,20 @@
+{
+  "name": "workbuddy-session-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WorkBuddy 会话桥接连接器：MCP stdio server，只读访问 WorkBuddy 本机会话，并以指令队列方式投递新指令。零第三方依赖。",
+  "main": "server.js",
+  "bin": {
+    "workbuddy-session-bridge": "server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke-test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "license": "MIT"
+}
