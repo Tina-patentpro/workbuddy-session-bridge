@@ -9,7 +9,9 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "node test/smoke-test.js"
+    "test": "node test/smoke-test.js",
+    "test:cli-control": "node --test --test-concurrency=1 test/managed/cli-stream.test.js test/managed/cli-init-stream.test.js test/managed/cli-probe-harness.test.js test/managed/cli-probe-storage-faults.test.js test/managed/cli-probe-budget.test.js test/managed/cli-init-clock.test.js test/managed/cli-init-transaction.test.js",
+    "test:bridge-offline": "node test/run-bridge-offline.js"
   },
   "engines": {
     "node": ">=18"
