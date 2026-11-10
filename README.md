@@ -3,6 +3,19 @@
 WorkBuddy 会话桥接连接器 —— 一个**零第三方依赖**的 MCP stdio Server，让外部本机 agent（Codex CLI 等 MCP 客户端）
 **读取** WorkBuddy 本机会话的对话输出，并**投递**新指令给 WorkBuddy 侧消费。
 
+## 从任一端开始安装
+
+任选一端先安装 Skill，它会指导配置本地 MCP 和安装另一端 Skill。完整步骤见 [安装使用指南](docs/installation.md)。
+
+| 起点 | 下载与使用 |
+| --- | --- |
+| Codex | [下载 Codex Skill 0.1.0](skills/packages/codex-workbuddy-bridge-0.1.0.zip?raw=true)，解压至 `~/.agents/skills/`，新开会话调用 `$codex-workbuddy-bridge` |
+| WorkBuddy | [下载 WorkBuddy Skill 0.1.2](skills/packages/workbuddy-bridge-consumer-0.1.2.zip?raw=true)，在「添加技能 → 上传技能」中导入 |
+
+只在 Codex 查看历史时配置 Codex 侧 MCP。任务投递、WorkBuddy 主动领取和结果回填需要两端 MCP 指向同一个本地队列。运行环境为 Node.js ≥18，零第三方依赖。
+
+[先从 Codex 开始](docs/installation.md#先从-codex-开始) · [先从 WorkBuddy 开始](docs/installation.md#先从-workbuddy-开始) · [配置与首次使用](docs/installation.md#准备本地运行环境)
+
 ## ⚠️ 能力边界（先读这一节）
 
 | 能力 | 支持 | 说明 |
@@ -267,105 +280,21 @@ stdio 传输 = **换行分隔的 JSON-RPC 2.0**（每行一个 JSON，无 `Conte
 
 ## 配置示例
 
-> 下列示例给出 **Windows** 与 **macOS** 两种形态；`command` / `args` 必须是**本机绝对路径**，
-> 换机后请自行替换（跨平台无其他差异，代码已按 `os.homedir()` 动态解析路径）。
+按 [安装使用指南](docs/installation.md) 配置本机绝对路径。指南提供 [Codex 的 TOML 示例](docs/installation.md#配置-codex-mcp)、[WorkBuddy 的 JSON 示例](docs/installation.md#配置-workbuddy-mcp) 和 [共享队列设置](docs/installation.md#核对同一个队列)，分别覆盖 macOS 和 Windows。
 
-### (a) Codex CLI —— `~/.codex/config.toml`
-
-**Windows**
-```toml
-[mcp_servers.workbuddy-session-bridge]
-command = "C:\\Users\\<用户名>\\.workbuddy\\binaries\\node\\versions\\22.22.2-6\\node.exe"
-args = ["C:\\Users\\<用户名>\\WorkBuddy\\2026-10-07-11-15-23\\workbuddy-session-bridge\\server.js"]
-```
-
-**macOS**（以下为本机实际部署路径，可直接抄）
-```toml
-[mcp_servers.workbuddy-session-bridge]
-command = "/Users/tinadong7036/.workbuddy/binaries/node/versions/22.22.2-6/bin/node"
-args = ["/Users/tinadong7036/Documents/开发项目/workbuddy连接器/workbuddy-session-bridge/server.js"]
-
-[mcp_servers.workbuddy-session-bridge.env]
-# 可选：把队列**根目录**指到别处（默认 <HOME>/.workbuddy/task-bridge）
-# 注意：WB_BRIDGE_STORE 是**目录**，不是 .json 文件；指向 .json 或已存在文件会被拒绝（STORE_CONFIG_INVALID）。
-# WB_BRIDGE_STORE = "/Users/<用户名>/.workbuddy/task-bridge"
-# 可选：设为 "0" 关闭 stderr 诊断日志
-# WB_BRIDGE_LOG = "1"
-```
-
-### (b) WorkBuddy —— `~/.workbuddy/mcp.json`（Windows `C:\Users\<用户名>\.workbuddy\mcp.json`）
-
-**Windows**
-```json
-{
-  "mcpServers": {
-    "workbuddy-session-bridge": {
-      "command": "C:\\Users\\<用户名>\\.workbuddy\\binaries\\node\\versions\\22.22.2-6\\node.exe",
-      "args": [
-        "C:\\Users\\<用户名>\\WorkBuddy\\2026-10-07-11-15-23\\workbuddy-session-bridge\\server.js"
-      ],
-      "env": {
-        "WB_BRIDGE_LOG": "1"
-      }
-    }
-  }
-}
-```
-
-**macOS**（以下为本机实际部署路径，可直接抄）
-```json
-{
-  "mcpServers": {
-    "workbuddy-session-bridge": {
-      "command": "/Users/tinadong7036/.workbuddy/binaries/node/versions/22.22.2-6/bin/node",
-      "args": [
-        "/Users/tinadong7036/Documents/开发项目/workbuddy连接器/workbuddy-session-bridge/server.js"
-      ],
-      "env": {
-        "WB_BRIDGE_LOG": "1"
-      }
-    }
-  }
-}
-```
-
-> 两个进程必须指向**同一个**队列根目录，队列才闭环。默认路径相同即满足。
->
-> macOS 实测（2026-10-14）：`~/.workbuddy/mcp.json` 写入上述配置、重启客户端后工具即生效。
+保存配置并重开客户端后，两端分别调用 `wb_bridge_info({})`，比较 `paths.storeRoot`。只读历史时只需 Codex 侧 MCP；任务交接需要两端连接同一个本地队列。
 
 ---
 
 ## WorkBuddy 侧如何消费队列（agent 提示词示例）
 
-把下面这段放进 WorkBuddy 内 agent 的系统提示词 / 项目指令里：
+先安装 [WorkBuddy 取件 Skill](skills/packages/workbuddy-bridge-consumer-0.1.2.zip?raw=true)，由用户在目标本地会话触发查看或执行。
 
-```
-你可以通过 MCP 工具 workbuddy-session-bridge 接收外部 agent 投递的指令。
+只查看时，可以说「用会话桥取件 Skill 看看发给当前会话的任务，只做只读预览」。取得实际 `sessionId` 后，使用 `wb_pending_instructions({sessionId,limit:5,markPicked:false})`。`remainingPending` 是全队列计数。
 
-工作流：
-1. 每一轮开始时（或用户说「看看外部有什么指令」时），调用 wb_pending_instructions 拉取待处理指令。
-   - **若你是「定向消费者」**（只处理投递给某个会话的指令）：**必须在领取前**传入 sessionId，
-     即 wb_pending_instructions({ sessionId: "<当前会话ID>", limit: 5, markPicked: true })。
-     否则你会把别的会话的指令也置为 picked，导致它们对你不可见、对原会话又已被领走（滞留）。
-   - 通用消费者（处理全部指令）可不传 sessionId：wb_pending_instructions({ limit: 5, markPicked: true })。
-   - 只想先看看有什么（不改变状态）：markPicked: false 做纯预览。
-2. 若 count=0，说明没有新指令，正常继续当前任务即可。
-3. 若 count>0，逐条执行 instructions[].instruction。
-   - metadata 里若有 deadline 等约束，优先满足。
-   - 由于已在领取时按 sessionId 过滤，这里通常无需再跳过；若确实拿到不属于自己的指令，用 result 说明后跳过。
-4. 每条执行完立刻调用 wb_complete_instruction 回填：
-   - 成功：status="done"，result={"summary":"<不超过 200 字的结果摘要>","artifacts":["相关文件路径"]}
-   - 失败：status="failed"，result={"error":"<失败原因>","retryable":true|false}
-5. 全部回填完成后，向用户汇报：处理了几条、成功几条、失败几条。
+执行时，先由用户授权具体任务，核对业务编号、桥接指令 ID、目标会话和输入输出范围，再领取一条获准任务。领取工具按会话筛选，预览不会锁定指令 ID，因此要确认实际领取时只会选中获准任务。执行后用同一个指令 ID 回填结果，并提供可核对的产物路径。
 
-注意：
-- wb_send_instruction 只是「投递队列」，你无法被外部 agent 直接驱动；
-  指令必须由你主动取件才会执行。
-- 拉取时默认已置为 picked；若执行前中断，请用 wb_instruction_stats
-  查看是否有长期滞留的 picked 指令并手工用 wb_complete_instruction 收尾。
-- 需要了解外部 agent 的意图时，用 wb_read_session / wb_search_sessions
-  读取历史会话上下文，而不是猜测。
-```
+投递、领取或回填超时后，保留原 ID 和产物，按具名证据核对。队列汇总计数和旧会话文本不能授权补做或回填某条任务。操作步骤见 [第一次使用](docs/installation.md#第一次使用) 和 [取件 Skill 原文](skills/workbuddy-bridge-consumer/SKILL.md)。
 
 ---
 
